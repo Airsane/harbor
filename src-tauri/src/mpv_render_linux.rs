@@ -54,6 +54,7 @@ struct Embed {
     gtk_window: gtk::ApplicationWindow,
     vbox: gtk::Box,
     web_view: gtk::Widget,
+    surface_primed: bool,
 }
 
 thread_local! {
@@ -310,6 +311,7 @@ pub fn install(gtk_window: &gtk::ApplicationWindow, vbox: &gtk::Box) -> Result<(
             gtk_window: gtk_window.clone(),
             vbox: vbox.clone(),
             web_view,
+            surface_primed: false,
         })
     });
 
@@ -392,6 +394,40 @@ pub fn resize_to(css: MpvGeometry) -> Result<(), String> {
         embed.area.queue_render();
     });
     Ok(())
+}
+
+pub fn prime_surface_after_playback() {
+    if !std::path::Path::new("/proc/driver/nvidia/version").exists() {
+        return;
+    }
+    let restore = EMBED.with(|slot| {
+        let mut guard = slot.borrow_mut();
+        let embed = guard.as_mut()?;
+        if embed.surface_primed {
+            return None;
+        }
+        embed.surface_primed = true;
+
+        let width = embed.gtk_window.allocated_width().max(1);
+        let height = embed.gtk_window.allocated_height().max(1);
+        embed.gtk_window.resize(width, height.saturating_add(1));
+        Some((
+            embed.gtk_window.clone(),
+            embed.area.clone(),
+            width,
+            height,
+        ))
+    });
+    let Some((window, area, width, height)) = restore else {
+        return;
+    };
+    // Let XWayland commit the intermediate size before restoring it. Two
+    // resize requests in the same idle cycle are coalesced and do not rebuild
+    // WebKit's stale backing surface.
+    glib::timeout_add_local_once(std::time::Duration::from_millis(80), move || {
+        window.resize(width, height);
+        area.queue_render();
+    });
 }
 
 pub fn uninstall() -> Result<(), String> {

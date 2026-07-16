@@ -729,7 +729,7 @@ fn spawn_event_loop(
         let mut last_timepos: Option<std::time::Instant> = None;
         #[cfg(windows)]
         let reassert_gen = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        #[cfg(not(windows))]
+        #[cfg(target_os = "macos")]
         let _ = embedded;
         #[cfg(not(target_os = "macos"))]
         let _ = mac_edr;
@@ -799,6 +799,12 @@ fn spawn_event_loop(
                                 apply_mac_edr(&app, &mpv_keepalive, active);
                             }
                         }
+                    }
+                    #[cfg(target_os = "linux")]
+                    if embedded && matches!(event, Event::PlaybackRestart) {
+                        let _ = app.run_on_main_thread(|| {
+                            crate::mpv_render_linux::prime_surface_after_playback();
+                        });
                     }
                     let payload = event_to_payload(event);
                     if let Some(p) = payload {
