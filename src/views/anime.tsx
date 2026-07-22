@@ -9,7 +9,12 @@ import { PickCard } from "@/components/pick-card";
 import { Row, ScrollRootContext } from "@/components/row";
 import { AnimeRankCard } from "@/components/top-rank-card";
 import { useAuth } from "@/lib/auth";
-import { createAddonCatalogFetcher, loadAddonRows, normalizeName, type AddonRow } from "@/lib/addons";
+import {
+  createAddonCatalogFetcher,
+  loadAddonRows,
+  normalizeName,
+  type AddonRow,
+} from "@/lib/addons";
 import type { Meta } from "@/lib/cinemeta";
 import { awardFranchiseKey, uniqueWinnerFranchisesAcrossSources } from "@/lib/anime-awards";
 import { publishResumeStates } from "@/lib/hover-preview/store";
@@ -24,6 +29,7 @@ import { detectAnimeForCw, useDetectedAnimeVersion } from "@/lib/anime-detect";
 import { AnilistRowControls } from "./anime/anilist-row-controls";
 import { MalRowControls } from "./anime/mal-row-controls";
 import { AnilistTopRow, AnilistTrendingRow } from "./anime/anilist-top-row";
+import { useCatalogPage, type CatalogRowSpec } from "@/lib/catalog-page";
 import {
   EMPTY_ROW,
   ROW_MAX_PAGES,
@@ -31,10 +37,10 @@ import {
   RowSkeleton,
   SPECS,
   TOP_PICKS_KEY,
-  isAnimeRow,
   type RowPool,
   type RowState,
 } from "./anime/anime-rows";
+import { isAnimeRow } from "@/lib/is-anime-row";
 import { animeFranchiseKey, stripFranchiseSuffix } from "@/lib/providers/jikan";
 import { franchiseRoot, franchiseRootSync } from "@/lib/providers/anime-franchise-root";
 import { animeFiltered, enrichAnimeCountry, type AnimeFilterOpts } from "@/lib/anime-filter";
@@ -53,14 +59,21 @@ import { useSettings } from "@/lib/settings";
 import { isAdultAnime } from "@/lib/addons-store/adult-filter";
 import { isAnimeCwItem, isCwMember, library, type LibraryItem } from "@/lib/stremio";
 import { clearLocalCw } from "@/lib/local-cw";
-import { dismissManualWatched, manualWatchedLibraryItems, manualWatchedVersion, subscribeManualWatched } from "@/lib/manual-watched";
+import {
+  dismissManualWatched,
+  manualWatchedLibraryItems,
+  manualWatchedVersion,
+  subscribeManualWatched,
+} from "@/lib/manual-watched";
 import { fetchSimklPlaybackItems } from "@/lib/simkl/playback";
-import { loadSimklWatchedMap, loadSimklStatusMap, type WatchlistStatus } from "@/lib/simkl/list-status";
+import {
+  loadSimklWatchedMap,
+  loadSimklStatusMap,
+  type WatchlistStatus,
+} from "@/lib/simkl/list-status";
 import { loadAnilistWatchedMap } from "@/lib/anilist/watched-map";
 import { useSimkl } from "@/lib/simkl/provider";
 import { useScrollMemory, useView } from "@/lib/view";
-
-export { isAnimeRow } from "./anime/anime-rows";
 
 function cleanMeta(m: Meta): Meta {
   const cleaned = stripFranchiseSuffix(m.name);
@@ -70,89 +83,48 @@ function cleanMeta(m: Meta): Meta {
 export function AnimeView({ active = true }: { active?: boolean }) {
   const t = useT();
   const { settings, update } = useSettings();
-  const [rowsByKey, setRowsByKey] = useState<Record<string, RowState>>(() => {
-    const init: Record<string, RowState> = {};
-    for (const s of SPECS) init[s.key] = EMPTY_ROW;
-    return init;
+
+  const animeSpecs = useMemo<CatalogRowSpec[]>(
+    () =>
+      SPECS.map((s) => ({
+        key: s.key,
+        title: s.title,
+        fetcher: s.fetcher,
+        minVisible: ROW_MIN_VISIBLE,
+      })),
+    [],
+  );
+
+  const { rowsByKey: catalogRowsByKey, loadMore } = useCatalogPage({
+    pageId: "anime",
+    scope: "jikan",
+    specs: animeSpecs,
+    enabled: active,
+    maxPerRow: 80,
   });
-  const rowsRef = useRef(rowsByKey);
-  const loadingRef = useRef<Set<string>>(new Set());
 
-  useEffect(() => {
-    rowsRef.current = rowsByKey;
-  }, [rowsByKey]);
-
-  useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      const BATCH = 6;
-      const GAP_MS = 350;
-      for (let i = 0; i < SPECS.length; i += BATCH) {
-        if (cancelled) return;
-        const batch = SPECS.slice(i, i + BATCH);
-        await Promise.all(
-          batch.map(async (s) => {
-            try {
-              const metas = await s.fetcher(1);
-              if (cancelled) return;
-              setRowsByKey((prev) => ({
-                ...prev,
-                [s.key]: { metas, page: 1, hasMore: metas.length >= ROW_MIN_VISIBLE, ready: true },
-              }));
-            } catch {
-              if (cancelled) return;
-              setRowsByKey((prev) => ({
-                ...prev,
-                [s.key]: { metas: [], page: 1, hasMore: false, ready: true },
-              }));
-            }
-          }),
-        );
-        if (i + BATCH < SPECS.length) {
-          await new Promise((r) => setTimeout(r, GAP_MS));
-        }
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, []);
-
-  const loadMore = useCallback((key: string) => {
-    if (loadingRef.current.has(key)) return;
-    const spec = SPECS.find((s) => s.key === key);
-    const row = rowsRef.current[key];
-    if (!spec || !row || !row.hasMore || row.metas.length >= 80) return;
-    loadingRef.current.add(key);
-    const next = row.page + 1;
-    spec
-      .fetcher(next)
-      .then((more) => {
-        setRowsByKey((prev) => {
-          const cur = prev[key];
-          if (!cur) return prev;
-          const ids = new Set(cur.metas.map((m) => m.id));
-          const fresh = more.filter((m) => !ids.has(m.id));
-          return {
-            ...prev,
-            [key]: {
-              ...cur,
-              metas: [...cur.metas, ...fresh],
-              page: next,
-              hasMore: more.length >= ROW_MIN_VISIBLE && cur.metas.length + fresh.length < 80,
-            },
-          };
-        });
-      })
-      .catch(() => {})
-      .finally(() => {
-        loadingRef.current.delete(key);
-      });
-  }, []);
+  // Keep anime-compatible RowState shape (ready flag for skeletons).
+  const rowsByKey = useMemo(() => {
+    const map: Record<string, RowState> = {};
+    for (const s of SPECS) {
+      const r = catalogRowsByKey[s.key];
+      map[s.key] = r
+        ? {
+            metas: r.metas,
+            page: r.page,
+            hasMore: r.hasMore && r.page < ROW_MAX_PAGES,
+            ready: r.ready,
+          }
+        : EMPTY_ROW;
+    }
+    return map;
+  }, [catalogRowsByKey]);
 
   const filterSig = `${settings.animeExcludeOrigins.join(",")}|${settings.animeHideWatchedPicks}`;
   const [heroSeed, setHeroSeed] = useState(() => Math.floor(Math.random() * 0x7fffffff));
-  const [hero, setHero] = useState<HeroBuilt>(() => readCachedHero(filterSig) ?? { metas: [], trending: {} });
+  const [hero, setHero] = useState<HeroBuilt>(
+    () => readCachedHero(filterSig) ?? { metas: [], trending: {} },
+  );
   const heroBuildRef = useRef(0);
   const heroResolvedRef = useRef(false);
   const heroBuildingRef = useRef(false);
@@ -230,7 +202,15 @@ export function AnimeView({ active = true }: { active?: boolean }) {
       .finally(() => {
         heroBuildingRef.current = false;
       });
-  }, [rowsByKey, heroSeed, hero.metas.length, anilistTrending, settings.tmdbKey, filterSig, hostedHero]);
+  }, [
+    rowsByKey,
+    heroSeed,
+    hero.metas.length,
+    anilistTrending,
+    settings.tmdbKey,
+    filterSig,
+    hostedHero,
+  ]);
   const heroMetas = hero.metas;
   const heroTrending = hero.trending;
 
@@ -246,8 +226,12 @@ export function AnimeView({ active = true }: { active?: boolean }) {
   const [libItems, setLibItems] = useState<LibraryItem[]>([]);
   const [simklCw, setSimklCw] = useState<LibraryItem[]>([]);
   const [simklWatchedMap, setSimklWatchedMap] = useState<Map<string, Set<string>>>(() => new Map());
-  const [simklStatusMap, setSimklStatusMap] = useState<Map<string, WatchlistStatus>>(() => new Map());
-  const [anilistWatchedMap, setAnilistWatchedMap] = useState<Map<string, Set<string>>>(() => new Map());
+  const [simklStatusMap, setSimklStatusMap] = useState<Map<string, WatchlistStatus>>(
+    () => new Map(),
+  );
+  const [anilistWatchedMap, setAnilistWatchedMap] = useState<Map<string, Set<string>>>(
+    () => new Map(),
+  );
   const [addonRows, setAddonRows] = useState<AddonRow[]>([]);
   useEffect(() => {
     if (!authKey) {
@@ -368,7 +352,9 @@ export function AnimeView({ active = true }: { active?: boolean }) {
   }, [simklConnected]);
   useEffect(() => {
     let cancelled = false;
-    const ids = continueWatching.filter((i) => /^(kitsu|mal|anilist):/.test(i._id)).map((i) => i._id);
+    const ids = continueWatching
+      .filter((i) => /^(kitsu|mal|anilist):/.test(i._id))
+      .map((i) => i._id);
     loadAnilistWatchedMap(ids)
       .then((m) => {
         if (!cancelled) setAnilistWatchedMap(m);
@@ -532,9 +518,7 @@ export function AnimeView({ active = true }: { active?: boolean }) {
       if (seen.has(key)) continue;
       seen.add(key);
       out.push(
-        settings.hideContent.adult
-          ? { ...r, metas: r.metas.filter((m) => !isAdultAnime(m)) }
-          : r,
+        settings.hideContent.adult ? { ...r, metas: r.metas.filter((m) => !isAdultAnime(m)) } : r,
       );
     }
     return out;
@@ -594,10 +578,7 @@ export function AnimeView({ active = true }: { active?: boolean }) {
   }, []);
 
   return (
-    <main
-      ref={scrollCb}
-      className="flex-1 overflow-y-auto overflow-x-hidden px-12 pt-28 pb-14"
-    >
+    <main ref={scrollCb} className="flex-1 overflow-y-auto overflow-x-hidden px-12 pt-28 pb-14">
       <ScrollRootContext.Provider value={scrollEl}>
         <div data-tauri-drag-region className="flex flex-col gap-12">
           {heroMetas.length > 0 ? (
@@ -742,9 +723,7 @@ export function AnimeView({ active = true }: { active?: boolean }) {
       {showPicker && (
         <AnimeGenrePicker
           initial={favoriteGenres}
-          onSave={(g) =>
-            update({ animeFavoriteGenres: g, animePicksDismissedAt: Date.now() })
-          }
+          onSave={(g) => update({ animeFavoriteGenres: g, animePicksDismissedAt: Date.now() })}
           onClose={() => {
             setShowPicker(false);
             update({ animePicksDismissedAt: Date.now() });
@@ -754,5 +733,3 @@ export function AnimeView({ active = true }: { active?: boolean }) {
     </main>
   );
 }
-
-

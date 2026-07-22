@@ -10,9 +10,9 @@ import { TmdbNudge } from "@/components/nudge";
 import { TopRankCard } from "@/components/top-rank-card";
 import { useAuth } from "@/lib/auth";
 import { topSeries, type Meta } from "@/lib/cinemeta";
+import { useCatalogPage, type CatalogRowSpec } from "@/lib/catalog-page";
 import { useT } from "@/lib/i18n";
 import { publishResumeStates } from "@/lib/hover-preview/store";
-import { listPager } from "@/lib/list-pager";
 import { hasPageRowChanges, resetPageRows, usePageRows } from "@/lib/page-rows";
 import { useSettings } from "@/lib/settings";
 import { cwSortKey, isAnimeCwItem, isCwMember, library, type LibraryItem } from "@/lib/stremio";
@@ -25,20 +25,52 @@ import {
 } from "@/lib/manual-watched";
 import { useCwAdvance } from "./home/hooks/use-cw-advance";
 import { useScrollMemory, useView } from "@/lib/view";
-import { buildShowHero, bucketCopy } from "./shows/hero-curation";
+import { bucketCopy, buildShowHero } from "./shows/hero-curation";
 import { showSpecs } from "./shows/show-specs";
 
 const HERO_POOL_TARGET = 6;
 const MAX_PER_ROW = 30;
 
-type ShowRow = {
-  key: string;
-  title: string;
-  metas: Meta[];
-  page: number;
-  hasMore: boolean;
-  fetcher?: (page: number) => Promise<Meta[]>;
-};
+const CINEMETA_GENRES = [
+  "Drama",
+  "Comedy",
+  "Crime",
+  "Sci-Fi",
+  "Thriller",
+  "Mystery",
+  "Action",
+  "Animation",
+  "Adventure",
+  "Fantasy",
+  "Documentary",
+  "Romance",
+  "Horror",
+] as const;
+
+function cinemetaShowSpecs(): CatalogRowSpec[] {
+  return [
+    {
+      key: "cinemeta-top",
+      title: "Top Series",
+      noPaginate: true,
+      fetcher: async () => {
+        const top = await topSeries().catch(() => [] as Meta[]);
+        return top.slice(0, 30);
+      },
+    },
+    ...CINEMETA_GENRES.map(
+      (g): CatalogRowSpec => ({
+        key: `cinemeta-genre-${g.toLowerCase().replace(/[^a-z]/g, "")}`,
+        title: `Top ${g}`,
+        noPaginate: true,
+        fetcher: async () => {
+          const list = await topSeries(g).catch(() => [] as Meta[]);
+          return list.slice(0, 30);
+        },
+      }),
+    ),
+  ];
+}
 
 export function Shows({ active = true }: { active?: boolean }) {
   const { settings } = useSettings();
@@ -47,17 +79,33 @@ export function Shows({ active = true }: { active?: boolean }) {
   const { openGrid } = useView();
   const t = useT();
   const pageRows = usePageRows("shows");
-  const [hero, setHero] = useState<Meta[]>([]);
-  const [rows, setRows] = useState<ShowRow[]>([]);
   const [items, setItems] = useState<LibraryItem[]>([]);
-  const rowsRef = useRef<ShowRow[]>([]);
-  const loadingRef = useRef<Set<string>>(new Set());
   const scrollRef = useRef<HTMLElement>(null);
   const [scrollEl, setScrollEl] = useState<HTMLElement | null>(null);
 
-  useEffect(() => {
-    rowsRef.current = rows;
-  }, [rows]);
+  const tmdbKey = settings.tmdbKey;
+  const region = settings.region;
+  const scope = tmdbKey ? `tmdb:${tmdbKey}:${region}` : "cinemeta";
+
+  const specs = useMemo<CatalogRowSpec[]>(
+    () => (tmdbKey ? showSpecs(tmdbKey) : cinemetaShowSpecs()),
+    [tmdbKey],
+  );
+
+  const heroFetcher = useCallback(async () => {
+    if (tmdbKey) return buildShowHero(tmdbKey);
+    const top = await topSeries().catch(() => [] as Meta[]);
+    return top.filter((m) => m.background).slice(0, HERO_POOL_TARGET);
+  }, [tmdbKey]);
+
+  const { hero, rows, loadMore, loading } = useCatalogPage({
+    pageId: "shows",
+    scope,
+    specs,
+    heroFetcher,
+    enabled: active,
+    maxPerRow: MAX_PER_ROW,
+  });
 
   useScrollMemory("shows", scrollRef, active);
 
@@ -71,86 +119,10 @@ export function Shows({ active = true }: { active?: boolean }) {
       setItems([]);
       return;
     }
-    library(authKey).then(setItems).catch(() => {});
+    library(authKey)
+      .then(setItems)
+      .catch(() => {});
   }, [authKey]);
-
-  useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      if (settings.tmdbKey) {
-        const heroPool = await buildShowHero(settings.tmdbKey).catch(() => [] as Meta[]);
-        const specs = showSpecs(settings.tmdbKey);
-        const firstPages = await Promise.all(
-          specs.map((s) => s.fetcher(1).catch(() => [] as Meta[])),
-        );
-        if (cancelled) return;
-        const built: ShowRow[] = specs
-          .map((spec, i) => ({
-            key: spec.key,
-            title: spec.title,
-            metas: firstPages[i],
-            page: 1,
-            hasMore: !spec.noPaginate && firstPages[i].length >= 14,
-            fetcher: spec.noPaginate ? undefined : spec.fetcher,
-          }))
-          .filter((r) => r.metas.length > 0);
-        if (built.length > 0) {
-          setHero(heroPool);
-          setRows(built);
-          return;
-        }
-      }
-      {
-        const genreList = [
-          "Drama",
-          "Comedy",
-          "Crime",
-          "Sci-Fi",
-          "Thriller",
-          "Mystery",
-          "Action",
-          "Animation",
-          "Adventure",
-          "Fantasy",
-          "Documentary",
-          "Romance",
-          "Horror",
-        ];
-        const [top, ...byGenre] = await Promise.all([
-          topSeries().catch(() => [] as Meta[]),
-          ...genreList.map((g) => topSeries(g).catch(() => [] as Meta[])),
-        ]);
-        if (cancelled) return;
-        setHero(top.filter((m) => m.background).slice(0, HERO_POOL_TARGET));
-        const built: ShowRow[] = [
-          {
-            key: "cinemeta-top",
-            title: "Top Series",
-            metas: top.slice(0, 30),
-            page: 1,
-            hasMore: false,
-            fetcher: listPager(top),
-          },
-        ];
-        for (let i = 0; i < genreList.length; i++) {
-          const list = byGenre[i] ?? [];
-          if (list.length === 0) continue;
-          built.push({
-            key: `cinemeta-genre-${genreList[i].toLowerCase().replace(/[^a-z]/g, "")}`,
-            title: `Top ${genreList[i]}`,
-            metas: list.slice(0, 30),
-            page: 1,
-            hasMore: false,
-            fetcher: listPager(list),
-          });
-        }
-        setRows(built);
-      }
-    })().catch(console.error);
-    return () => {
-      cancelled = true;
-    };
-  }, [settings.tmdbKey]);
 
   const continueWatching = useMemo(
     () =>
@@ -186,37 +158,6 @@ export function Shows({ active = true }: { active?: boolean }) {
     publishResumeStates(cwItems);
   }, [cwItems]);
 
-  const loadMore = useCallback((rowKey: string) => {
-    if (loadingRef.current.has(rowKey)) return;
-    const row = rowsRef.current.find((r) => r.key === rowKey);
-    if (!row || !row.fetcher || !row.hasMore || row.metas.length >= MAX_PER_ROW) return;
-    loadingRef.current.add(rowKey);
-    const next = row.page + 1;
-    row
-      .fetcher(next)
-      .then((more) => {
-        setRows((rs) =>
-          rs.map((r) => {
-            if (r.key !== rowKey) return r;
-            const ids = new Set(r.metas.map((m) => m.id));
-            const fresh = more.filter((m) => !ids.has(m.id));
-            const combined = [...r.metas, ...fresh];
-            const reachedCap = combined.length >= MAX_PER_ROW;
-            return {
-              ...r,
-              metas: reachedCap ? combined.slice(0, MAX_PER_ROW) : combined,
-              page: next,
-              hasMore: !reachedCap && more.length > 0,
-            };
-          }),
-        );
-      })
-      .catch(() => {})
-      .finally(() => {
-        loadingRef.current.delete(rowKey);
-      });
-  }, []);
-
   const top10 = useMemo(() => {
     const trending = rows.find((r) => r.key === "trending");
     if (!trending) return [] as Meta[];
@@ -232,8 +173,8 @@ export function Shows({ active = true }: { active?: boolean }) {
         ...r,
         metas: r.metas.filter((m) => !seen.has(m.id)),
       }))
-      .filter((r) => r.metas.length >= 4);
-  }, [rows, hero, top10.length]);
+      .filter((r) => r.metas.length >= (loading && rows.length < 3 ? 1 : 4));
+  }, [rows, hero, top10.length, loading]);
 
   return (
     <main ref={scrollCb} className="relative h-full overflow-y-auto bg-canvas">
@@ -241,7 +182,11 @@ export function Shows({ active = true }: { active?: boolean }) {
         <div className="relative flex w-full flex-col gap-12 px-12 pb-32 pt-32">
           <PageMast />
           <div className="relative">
-            <PeekHero slides={hero} />
+            {hero.length > 0 ? (
+              <PeekHero slides={hero} />
+            ) : (
+              <div className="h-[36vh] min-h-[240px] w-full animate-pulse rounded-2xl bg-elevated/40" />
+            )}
             <div className="absolute bottom-3 end-3 z-20">
               <CatalogCustomizeBar
                 editMode={pageRows.editMode}
@@ -252,8 +197,30 @@ export function Shows({ active = true }: { active?: boolean }) {
             </div>
           </div>
           {!settings.tmdbKey && <TmdbNudge />}
+          {loading && restRows.length === 0 && (
+            <div className="flex flex-col gap-10">
+              {Array.from({ length: 3 }).map((_, i) => (
+                <div key={i} className="flex flex-col gap-4">
+                  <div className="h-5 w-48 animate-pulse rounded bg-elevated/50" />
+                  <div className="flex gap-5 overflow-hidden">
+                    {Array.from({ length: 7 }).map((_, j) => (
+                      <div
+                        key={j}
+                        className="h-52 w-36 shrink-0 animate-pulse rounded-xl bg-elevated/40"
+                      />
+                    ))}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
           {cwItems.length > 0 && (
-            <Row title={t("Pick up where you left off")} min={260} shape="landscape" scrollKey="shows:cw">
+            <Row
+              title={t("Pick up where you left off")}
+              min={260}
+              shape="landscape"
+              scrollKey="shows:cw"
+            >
               {cwItems.map((it) => (
                 <ContinueCard
                   key={it._id}
@@ -318,9 +285,7 @@ function PageMast() {
       <h1 className="font-display text-[44px] font-medium leading-[1.05] tracking-tight text-ink">
         {t(copy.title)}
       </h1>
-      <p className="max-w-2xl text-[15px] leading-relaxed text-ink-muted">
-        {t(copy.subtitle)}
-      </p>
+      <p className="max-w-2xl text-[15px] leading-relaxed text-ink-muted">{t(copy.subtitle)}</p>
     </header>
   );
 }

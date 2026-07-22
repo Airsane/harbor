@@ -28,7 +28,7 @@ walkdir = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
-tokio-util = { version = "0.7", features = ["io"] }
+tokio-util = { version = "0.7", features = ["io", "rt"] }
 axum = { version = "0.8", features = ["ws"] }
 reqwest = { version = "0.12", default-features = false, features = [
   "native-tls",
@@ -79,7 +79,7 @@ windows = { version = "0.61", features = [
 ] }
 window-vibrancy = "0.6"
 wasapi = "0.15"
-webview2-com = "0.37"
+webview2-com = "0.38"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 gtk = { version = "0.18", features = ["v3_24"] }

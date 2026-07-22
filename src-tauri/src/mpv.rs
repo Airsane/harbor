@@ -15,9 +15,7 @@ fn mpv_argv_command(mpv: &Mpv, argv: &[&str]) -> Result<(), String> {
         .collect::<Result<Vec<_>, _>>()?;
     let mut ptrs: Vec<*const std::os::raw::c_char> = cstrings.iter().map(|c| c.as_ptr()).collect();
     ptrs.push(std::ptr::null());
-    let rc = unsafe {
-        libmpv2_sys::mpv_command(mpv.ctx.as_ptr(), ptrs.as_mut_ptr())
-    };
+    let rc = unsafe { libmpv2_sys::mpv_command(mpv.ctx.as_ptr(), ptrs.as_mut_ptr()) };
     if rc < 0 {
         return Err(format!("mpv_command rc={}", rc));
     }
@@ -25,8 +23,8 @@ fn mpv_argv_command(mpv: &Mpv, argv: &[&str]) -> Result<(), String> {
 }
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tauri::{AppHandle, Emitter, State};
 use tauri::Manager;
+use tauri::{AppHandle, Emitter, State};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
@@ -46,6 +44,7 @@ pub struct MpvStartArgs {
     pub subtitles: Option<Vec<MpvSub>>,
     pub anime4k: Option<bool>,
     pub hdr_to_sdr: Option<bool>,
+    pub rtx_hdr: Option<bool>,
     pub embed: Option<bool>,
     pub anime4k_shaders: Option<Vec<String>>,
     pub d3d11_flip: Option<bool>,
@@ -67,6 +66,7 @@ pub struct MpvGeometry {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
 pub(crate) struct NativeMpvRect {
     pub x: f64,
     pub y: f64,
@@ -74,6 +74,7 @@ pub(crate) struct NativeMpvRect {
     pub height: f64,
 }
 
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
 pub(crate) fn map_css_geometry(
     css: &MpvGeometry,
     native_width: f64,
@@ -126,7 +127,12 @@ pub(crate) fn map_css_geometry(
     width = width.clamp(1.0, (native_width - x).max(1.0));
     height = height.clamp(1.0, (native_height - y).max(1.0));
 
-    NativeMpvRect { x, y, width, height }
+    NativeMpvRect {
+        x,
+        y,
+        width,
+        height,
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -282,6 +288,7 @@ fn apply_pre_init(
     args: &MpvStartArgs,
     embed_hwnd: Option<&str>,
 ) -> Result<(), String> {
+    let rtx_hdr = cfg!(windows) && args.rtx_hdr.unwrap_or(false);
     // Property sets here are best-effort. Some builds of mpv (e.g. Flatpak's
     // meson build without Lua) omit optional properties like `osc`. Treat
     // PROPERTY_NOT_FOUND as non-fatal so the player still initializes.
@@ -321,7 +328,7 @@ fn apply_pre_init(
             set("force-window", "yes");
         }
     } else if cfg!(windows) {
-        set("hwdec", "auto-copy");
+        set("hwdec", if rtx_hdr { "d3d11va" } else { "auto" });
         set("force-window", "immediate");
     } else {
         set("hwdec", "auto");
@@ -351,8 +358,11 @@ fn apply_pre_init(
     if let Some(hwnd) = embed_hwnd {
         #[cfg(windows)]
         {
-            let hwnd_i64: i64 = hwnd.parse().map_err(|e| format!("parse wid {}: {}", hwnd, e))?;
-            init.set_property("wid", hwnd_i64).map_err(|e| format!("set wid={}: {}", hwnd_i64, e))?;
+            let hwnd_i64: i64 = hwnd
+                .parse()
+                .map_err(|e| format!("parse wid {}: {}", hwnd, e))?;
+            init.set_property("wid", hwnd_i64)
+                .map_err(|e| format!("set wid={}: {}", hwnd_i64, e))?;
             if args.d3d11_flip.unwrap_or(false) && args.hdr_to_sdr.unwrap_or(false) {
                 set("d3d11-flip", "no");
             }
@@ -369,7 +379,7 @@ fn apply_pre_init(
     let opt = |k: &str, v: &str| {
         let _ = init.set_property(k, v);
     };
-    if args.hdr_to_sdr.unwrap_or(false) {
+    if args.hdr_to_sdr.unwrap_or(false) && !rtx_hdr {
         opt("tone-mapping", "spline");
         opt("gamut-mapping-mode", "perceptual");
         opt("hdr-compute-peak", "yes");
@@ -384,7 +394,7 @@ fn apply_pre_init(
         #[cfg(windows)]
         {
             opt("target-colorspace-hint", "yes");
-            if embed_hwnd.is_some() {
+            if embed_hwnd.is_some() || rtx_hdr {
                 opt("gpu-api", "d3d11");
             }
         }
@@ -395,7 +405,11 @@ fn apply_pre_init(
     }
 
     if let Some(shaders) = &args.anime4k_shaders {
-        let cleaned: Vec<&str> = shaders.iter().filter(|s| !s.is_empty()).map(|s| s.as_str()).collect();
+        let cleaned: Vec<&str> = shaders
+            .iter()
+            .filter(|s| !s.is_empty())
+            .map(|s| s.as_str())
+            .collect();
         if !cleaned.is_empty() {
             let sep = if cfg!(windows) { ";" } else { ":" };
             let joined = cleaned.join(sep);
@@ -430,7 +444,10 @@ fn apply_extra_mpv_options(mpv: &Mpv, raw: &str) {
         }
         match mpv.set_property(key, value) {
             Ok(()) => eprintln!("[harbor::mpv] extra option set {}={}", key, value),
-            Err(e) => eprintln!("[harbor::mpv] extra option {}={} rejected: {:?}", key, value, e),
+            Err(e) => eprintln!(
+                "[harbor::mpv] extra option {}={} rejected: {:?}",
+                key, value, e
+            ),
         }
     }
 }
@@ -473,9 +490,15 @@ pub async fn mpv_start(
     }
 
     let want_embed = args.embed.unwrap_or(false);
-    let embed_hwnd = if want_embed { get_main_hwnd_str(&app) } else { None };
-    eprintln!("[harbor::mpv] start url={} want_embed={} embed_hwnd={:?}",
-        args.url, want_embed, embed_hwnd);
+    let embed_hwnd = if want_embed {
+        get_main_hwnd_str(&app)
+    } else {
+        None
+    };
+    eprintln!(
+        "[harbor::mpv] start url={} want_embed={} embed_hwnd={:?}",
+        args.url, want_embed, embed_hwnd
+    );
     let embed_hwnd_for_init = embed_hwnd.clone();
     let args_for_init = args.clone();
     let init_err: Arc<std::sync::Mutex<Option<String>>> = Arc::new(std::sync::Mutex::new(None));
@@ -569,8 +592,12 @@ pub async fn mpv_start(
                 let p = std::ptr::NonNull::new(mpv_ctx_addr as *mut libmpv2_sys::mpv_handle)
                     .ok_or_else(|| "null mpv ctx".to_string())?;
                 crate::mpv_render_linux::prepare(p)?;
-                let gtk_window = window.gtk_window().map_err(|e| format!("gtk_window: {:?}", e))?;
-                let vbox = window.default_vbox().map_err(|e| format!("default_vbox: {:?}", e))?;
+                let gtk_window = window
+                    .gtk_window()
+                    .map_err(|e| format!("gtk_window: {:?}", e))?;
+                let vbox = window
+                    .default_vbox()
+                    .map_err(|e| format!("default_vbox: {:?}", e))?;
                 crate::mpv_render_linux::install(&gtk_window, &vbox)
             })();
             let _ = tx.send(res);
@@ -597,7 +624,10 @@ pub async fn mpv_start(
         let _ = mpv.set_property("demuxer-max-back-bytes", "16MiB");
         let _ = mpv.set_property("demuxer-readahead-secs", "20");
         let _ = mpv.set_property("network-timeout", "60");
-        let _ = mpv.set_property("stream-lavf-o", "reconnect=1,reconnect_streamed=1,reconnect_delay_max=5,reconnect_on_network_error=1");
+        let _ = mpv.set_property(
+            "stream-lavf-o",
+            "reconnect=1,reconnect_streamed=1,reconnect_delay_max=5,reconnect_on_network_error=1",
+        );
         let _ = mpv.set_property("stream-buffer-size", "16MiB");
     } else {
         let _ = mpv.set_property("cache", "yes");
@@ -615,7 +645,10 @@ pub async fn mpv_start(
         }
         let _ = mpv.set_property("cache-on-disk", "yes");
         let _ = mpv.set_property("network-timeout", "600");
-        let _ = mpv.set_property("stream-lavf-o", "reconnect=1,reconnect_streamed=1,reconnect_delay_max=10,reconnect_on_network_error=1");
+        let _ = mpv.set_property(
+            "stream-lavf-o",
+            "reconnect=1,reconnect_streamed=1,reconnect_delay_max=10,reconnect_on_network_error=1",
+        );
         let _ = mpv.set_property("stream-buffer-size", "32MiB");
     }
     if want_embed {
@@ -667,10 +700,25 @@ pub async fn mpv_start(
             eprintln!("[mpv] observe {} failed: {}", name, e);
         }
     }
-    spawn_event_loop(app.clone(), mpv_arc.clone(), event_ctx, want_embed, args.mac_edr.unwrap_or(false));
+    spawn_event_loop(
+        app.clone(),
+        mpv_arc.clone(),
+        event_ctx,
+        want_embed,
+        args.mac_edr.unwrap_or(false),
+    );
 
-    eprintln!("[harbor::mpv] loadfile {}", args.url);
-    mpv_argv_command(&*mpv_arc, &["loadfile", &args.url, "replace"]).map_err(|e| {
+    let start_at_sec = args.start_at_sec.filter(|start| *start > 0.0);
+    let start_option = start_at_sec.map(|start| format!("start={start}"));
+    let mut load_args = vec!["loadfile", args.url.as_str(), "replace", "0"];
+    if let Some(start_option) = start_option.as_deref() {
+        load_args.push(start_option);
+    }
+    eprintln!(
+        "[harbor::mpv] loadfile {} start_at_sec={:?}",
+        args.url, start_at_sec
+    );
+    mpv_argv_command(&*mpv_arc, &load_args).map_err(|e| {
         eprintln!("[harbor::mpv] loadfile FAILED: {}", e);
         format!("loadfile: {}", e)
     })?;
@@ -684,6 +732,12 @@ pub async fn mpv_start(
         embedded: use_render_api,
     });
     drop(g);
+
+    #[cfg(windows)]
+    if want_embed {
+        // Reveal video under the UI only while embedded playback is active.
+        crate::webview_helpers::apply_transparency(&app, "main");
+    }
 
     #[cfg(not(windows))]
     let _ = embed_hwnd;
@@ -718,6 +772,32 @@ fn apply_mac_edr(app: &AppHandle, mpv: &Arc<Mpv>, active: bool) {
     });
 }
 
+const MPV_EVENT_MAX_CONSECUTIVE_ERRORS: u32 = 12;
+
+#[derive(Default)]
+struct EventErrorBackoff {
+    consecutive: u32,
+}
+
+impl EventErrorBackoff {
+    fn reset(&mut self) {
+        self.consecutive = 0;
+    }
+
+    fn next_delay(&mut self) -> Option<Duration> {
+        self.consecutive = self.consecutive.saturating_add(1);
+        if self.consecutive >= MPV_EVENT_MAX_CONSECUTIVE_ERRORS {
+            return None;
+        }
+        let shift = self.consecutive.saturating_sub(1).min(5);
+        Some(Duration::from_millis((40_u64 << shift).min(1_000)))
+    }
+}
+
+fn record_event_poll_success(backoff: &mut EventErrorBackoff) {
+    backoff.reset();
+}
+
 fn spawn_event_loop(
     app: AppHandle,
     mpv_keepalive: Arc<Mpv>,
@@ -733,10 +813,12 @@ fn spawn_event_loop(
         let _ = embedded;
         #[cfg(not(target_os = "macos"))]
         let _ = mac_edr;
+        let mut error_backoff = EventErrorBackoff::default();
         loop {
             let res = ctx.wait_event(0.5);
             match res {
                 Some(Ok(event)) => {
+                    record_event_poll_success(&mut error_backoff);
                     let mut shutdown = false;
                     if matches!(event, Event::Shutdown) {
                         shutdown = true;
@@ -815,12 +897,35 @@ fn spawn_event_loop(
                     }
                 }
                 Some(Err(e)) => {
-                    eprintln!("[mpv] event err: {}", e);
+                    let delay = error_backoff.next_delay();
+                    if error_backoff.consecutive == 1 || error_backoff.consecutive.is_power_of_two()
+                    {
+                        eprintln!(
+                            "[mpv] event error (consecutive={}): {}",
+                            error_backoff.consecutive, e
+                        );
+                    }
                     if matches!(e, libmpv2::Error::Raw(-13 | -16)) {
-                        let _ = app.emit("mpv://event", json!({ "event": "end-file", "reason": "error" }));
+                        let _ = app.emit(
+                            "mpv://event",
+                            json!({ "event": "end-file", "reason": "error" }),
+                        );
+                    }
+                    match delay {
+                        Some(delay) => std::thread::sleep(delay),
+                        None => {
+                            let _ = app.emit(
+                                "mpv://event",
+                                json!({
+                                    "event": "player-failure",
+                                    "reason": "persistent-event-errors",
+                                }),
+                            );
+                            break;
+                        }
                     }
                 }
-                None => {}
+                None => record_event_poll_success(&mut error_backoff),
             }
         }
         drop(mpv_keepalive);
@@ -855,9 +960,12 @@ fn event_to_payload(event: Event) -> Option<Value> {
         Event::PlaybackRestart => Some(json!({ "event": "playback-restart" })),
         Event::Seek => Some(json!({ "event": "seek" })),
         Event::Shutdown => Some(json!({ "event": "shutdown" })),
-        Event::LogMessage { prefix, level, text, .. } => {
-            Some(json!({ "event": "log", "prefix": prefix, "level": level, "text": text }))
-        }
+        Event::LogMessage {
+            prefix,
+            level,
+            text,
+            ..
+        } => Some(json!({ "event": "log", "prefix": prefix, "level": level, "text": text })),
         _ => None,
     }
 }
@@ -881,18 +989,19 @@ fn mpv_node_to_json(node: MpvNode) -> Value {
 }
 
 #[tauri::command]
-pub async fn mpv_command(
-    state: State<'_, MpvState>,
-    cmd: Vec<Value>,
-) -> Result<(), String> {
+pub async fn mpv_command(state: State<'_, MpvState>, cmd: Vec<Value>) -> Result<(), String> {
     let mpv = {
         let g = state.inner.lock().await;
-        g.as_ref().map(|s| s.mpv.clone()).ok_or_else(|| "mpv not started".to_string())?
+        g.as_ref()
+            .map(|s| s.mpv.clone())
+            .ok_or_else(|| "mpv not started".to_string())?
     };
     if cmd.is_empty() {
         return Err("empty command".into());
     }
-    let head = cmd[0].as_str().ok_or_else(|| "first arg must be string".to_string())?;
+    let head = cmd[0]
+        .as_str()
+        .ok_or_else(|| "first arg must be string".to_string())?;
     if !MPV_ALLOWED_COMMANDS.contains(&head) {
         return Err(format!("mpv command not allowed: {}", head));
     }
@@ -906,14 +1015,25 @@ pub async fn mpv_command(
 }
 
 const MPV_ALLOWED_COMMANDS: &[&str] = &[
-    "af", "seek", "stop", "frame-step", "frame-back-step", "loadfile",
+    "af",
+    "vf",
+    "seek",
+    "stop",
+    "frame-step",
+    "frame-back-step",
+    "loadfile",
 ];
 
 fn mpv_property_blocked(name: &str) -> bool {
     let n = name.to_ascii_lowercase();
     const BLOCKED: &[&str] = &[
-        "script", "input-", "load-scripts", "ytdl-raw", "screenshot-directory",
-        "screenshot-template", "sub-add",
+        "script",
+        "input-",
+        "load-scripts",
+        "ytdl-raw",
+        "screenshot-directory",
+        "screenshot-template",
+        "sub-add",
     ];
     BLOCKED.iter().any(|b| n.starts_with(b))
 }
@@ -921,7 +1041,13 @@ fn mpv_property_blocked(name: &str) -> bool {
 fn value_to_arg(v: &Value) -> String {
     match v {
         Value::String(s) => s.clone(),
-        Value::Bool(b) => if *b { "yes".into() } else { "no".into() },
+        Value::Bool(b) => {
+            if *b {
+                "yes".into()
+            } else {
+                "no".into()
+            }
+        }
         Value::Number(n) => n.to_string(),
         Value::Null => String::new(),
         _ => v.to_string(),
@@ -936,23 +1062,25 @@ pub async fn mpv_set_property(
 ) -> Result<(), String> {
     let mpv = {
         let g = state.inner.lock().await;
-        g.as_ref().map(|s| s.mpv.clone()).ok_or_else(|| "mpv not started".to_string())?
+        g.as_ref()
+            .map(|s| s.mpv.clone())
+            .ok_or_else(|| "mpv not started".to_string())?
     };
     if mpv_property_blocked(&name) {
         return Err(format!("mpv property not allowed: {}", name));
     }
     let str_val = value_to_arg(&value);
-    mpv.set_property(&name, str_val.as_str()).map_err(|e| format!("set {}: {}", name, e))
+    mpv.set_property(&name, str_val.as_str())
+        .map_err(|e| format!("set {}: {}", name, e))
 }
 
 #[tauri::command]
-pub async fn mpv_get_property(
-    state: State<'_, MpvState>,
-    name: String,
-) -> Result<Value, String> {
+pub async fn mpv_get_property(state: State<'_, MpvState>, name: String) -> Result<Value, String> {
     let mpv = {
         let g = state.inner.lock().await;
-        g.as_ref().map(|s| s.mpv.clone()).ok_or_else(|| "mpv not started".to_string())?
+        g.as_ref()
+            .map(|s| s.mpv.clone())
+            .ok_or_else(|| "mpv not started".to_string())?
     };
     let s = mpv
         .get_property::<String>(&name)
@@ -997,12 +1125,12 @@ pub async fn mpv_set_geometry(
             g.as_ref().map(|s| s.embedded).unwrap_or(false)
         };
         if embedded {
-            let (tx, rx) = std::sync::mpsc::sync_channel::<()>(1);
+            // GLArea fills the full window via GTK expand flags, so
+            // geometry tracking is redundant. We still dispatch to the
+            // main thread as a rendering tickle for the GLArea.
             let _ = app.run_on_main_thread(move || {
                 let _ = crate::mpv_render_linux::resize_to(geom);
-                let _ = tx.send(());
             });
-            let _ = rx.recv_timeout(std::time::Duration::from_millis(300));
             return Ok(());
         }
     }
@@ -1013,13 +1141,19 @@ pub async fn mpv_set_geometry(
     {
         let mpv = {
             let g = _state.inner.lock().await;
-            g.as_ref().map(|s| s.mpv.clone()).ok_or_else(|| "mpv not started".to_string())?
+            g.as_ref()
+                .map(|s| s.mpv.clone())
+                .ok_or_else(|| "mpv not started".to_string())?
         };
         let geo = format!(
             "{}x{}+{}+{}",
-            geom.css_width as i32, geom.css_height as i32, geom.css_left as i32, geom.css_top as i32
+            geom.css_width as i32,
+            geom.css_height as i32,
+            geom.css_left as i32,
+            geom.css_top as i32
         );
-        mpv.set_property("geometry", geo.as_str()).map_err(|e| format!("geometry: {}", e))
+        mpv.set_property("geometry", geo.as_str())
+            .map_err(|e| format!("geometry: {}", e))
     }
 }
 
@@ -1064,13 +1198,12 @@ pub async fn mpv_force_below(_app: AppHandle) -> Result<(), String> {
         struct EnumState {
             mpv_hwnds: Vec<isize>,
         }
-        let mut state = EnumState { mpv_hwnds: Vec::new() };
+        let mut state = EnumState {
+            mpv_hwnds: Vec::new(),
+        };
         let state_ptr = &mut state as *mut EnumState;
 
-        unsafe extern "system" fn enum_proc(
-            hwnd: HWND,
-            lparam: LPARAM,
-        ) -> windows::core::BOOL {
+        unsafe extern "system" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> windows::core::BOOL {
             let mut class_buf = [0u16; 256];
             let class_len = GetClassNameW(hwnd, &mut class_buf);
             let class_name = String::from_utf16_lossy(&class_buf[..class_len as usize]);
@@ -1208,7 +1341,9 @@ pub async fn mpv_save_screenshot(
 ) -> Result<String, String> {
     let mpv = {
         let g = state.inner.lock().await;
-        g.as_ref().map(|s| s.mpv.clone()).ok_or_else(|| "mpv not started".to_string())?
+        g.as_ref()
+            .map(|s| s.mpv.clone())
+            .ok_or_else(|| "mpv not started".to_string())?
     };
     if let Some(parent) = std::path::Path::new(&path).parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -1262,7 +1397,9 @@ pub struct GifResult {
 pub async fn mpv_gif_start(state: State<'_, MpvState>) -> Result<(), String> {
     let mpv = {
         let g = state.inner.lock().await;
-        g.as_ref().map(|s| s.mpv.clone()).ok_or_else(|| "mpv not started".to_string())?
+        g.as_ref()
+            .map(|s| s.mpv.clone())
+            .ok_or_else(|| "mpv not started".to_string())?
     };
     {
         let g = gif_slot().lock().map_err(|e| format!("gif lock: {}", e))?;
@@ -1288,22 +1425,35 @@ pub async fn mpv_gif_start(state: State<'_, MpvState>) -> Result<(), String> {
             let p = path.to_string_lossy().to_string();
             if mpv_argv_command(&mpv, &["screenshot-to-file", p.as_str(), "video"]).is_ok() {
                 frame += 1;
-                captured_task
-                    .store(started.elapsed().as_millis() as u64, std::sync::atomic::Ordering::Relaxed);
+                captured_task.store(
+                    started.elapsed().as_millis() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
             }
             tokio::time::sleep(Duration::from_millis(GIF_FRAME_INTERVAL_MS)).await;
         }
     });
-    *gif_slot().lock().map_err(|e| format!("gif lock: {}", e))? =
-        Some(GifSession { dir, stop, handle, captured_ms });
+    *gif_slot().lock().map_err(|e| format!("gif lock: {}", e))? = Some(GifSession {
+        dir,
+        stop,
+        handle,
+        captured_ms,
+    });
     Ok(())
 }
 
 #[tauri::command]
 pub async fn mpv_gif_abort() -> Result<(), String> {
-    let session = { gif_slot().lock().map_err(|e| format!("gif lock: {}", e))?.take() };
+    let session = {
+        gif_slot()
+            .lock()
+            .map_err(|e| format!("gif lock: {}", e))?
+            .take()
+    };
     if let Some(session) = session {
-        session.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        session
+            .stop
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         let _ = session.handle.await;
         let _ = std::fs::remove_dir_all(&session.dir);
     }
@@ -1312,11 +1462,18 @@ pub async fn mpv_gif_abort() -> Result<(), String> {
 
 #[tauri::command]
 pub async fn mpv_gif_stop(out_path: String) -> Result<GifResult, String> {
-    let session = { gif_slot().lock().map_err(|e| format!("gif lock: {}", e))?.take() };
+    let session = {
+        gif_slot()
+            .lock()
+            .map_err(|e| format!("gif lock: {}", e))?
+            .take()
+    };
     let Some(session) = session else {
         return Err("not recording".into());
     };
-    session.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    session
+        .stop
+        .store(true, std::sync::atomic::Ordering::Relaxed);
     let _ = session.handle.await;
     tokio::time::sleep(Duration::from_millis(300)).await;
 
@@ -1331,7 +1488,9 @@ pub async fn mpv_gif_stop(out_path: String) -> Result<GifResult, String> {
         return Err("no frames captured".into());
     }
 
-    let window_ms = session.captured_ms.load(std::sync::atomic::Ordering::Relaxed);
+    let window_ms = session
+        .captured_ms
+        .load(std::sync::atomic::Ordering::Relaxed);
     let n = frames.len() as f64;
     let fps = if n >= 2.0 && window_ms >= 200 {
         (n / (window_ms as f64 / 1000.0)).clamp(2.0, 30.0)
@@ -1349,7 +1508,10 @@ pub async fn mpv_gif_stop(out_path: String) -> Result<GifResult, String> {
         list.push_str(&format!("file '{}'\nduration {:.4}\n", name, dur));
     }
     if let Some(last) = frames.last() {
-        let name = last.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+        let name = last
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default();
         list.push_str(&format!("file '{}'\n", name));
     }
     std::fs::write(&list_path, list).map_err(|e| format!("write list: {}", e))?;
@@ -1360,7 +1522,10 @@ pub async fn mpv_gif_stop(out_path: String) -> Result<GifResult, String> {
     let palette = session.dir.join("palette.png");
     let list_str = list_path.to_string_lossy().to_string();
     let palette_str = palette.to_string_lossy().to_string();
-    let vf_pal = format!("fps={:.3},scale=640:-2:flags=lanczos,palettegen=stats_mode=diff", fps);
+    let vf_pal = format!(
+        "fps={:.3},scale=640:-2:flags=lanczos,palettegen=stats_mode=diff",
+        fps
+    );
     let lavfi = format!(
         "fps={:.3},scale=640:-2:flags=lanczos[x];[x][1:v]paletteuse=dither=bayer:bayer_scale=3",
         fps
@@ -1368,7 +1533,18 @@ pub async fn mpv_gif_stop(out_path: String) -> Result<GifResult, String> {
 
     let pass1 = run_gif_ffmpeg(
         &ffmpeg,
-        &["-y", "-f", "concat", "-safe", "0", "-i", &list_str, "-vf", &vf_pal, &palette_str],
+        &[
+            "-y",
+            "-f",
+            "concat",
+            "-safe",
+            "0",
+            "-i",
+            &list_str,
+            "-vf",
+            &vf_pal,
+            &palette_str,
+        ],
     )
     .await;
     if let Err(e) = pass1 {
@@ -1378,8 +1554,18 @@ pub async fn mpv_gif_stop(out_path: String) -> Result<GifResult, String> {
     let pass2 = run_gif_ffmpeg(
         &ffmpeg,
         &[
-            "-y", "-f", "concat", "-safe", "0", "-i", &list_str, "-i", &palette_str, "-lavfi",
-            &lavfi, out_path.as_str(),
+            "-y",
+            "-f",
+            "concat",
+            "-safe",
+            "0",
+            "-i",
+            &list_str,
+            "-i",
+            &palette_str,
+            "-lavfi",
+            &lavfi,
+            out_path.as_str(),
         ],
     )
     .await;
@@ -1387,7 +1573,10 @@ pub async fn mpv_gif_stop(out_path: String) -> Result<GifResult, String> {
     if let Err(e) = pass2 {
         return Err(format!("paletteuse: {}", e));
     }
-    Ok(GifResult { path: out_path, frames: frames.len() as u32 })
+    Ok(GifResult {
+        path: out_path,
+        frames: frames.len() as u32,
+    })
 }
 
 async fn run_gif_ffmpeg(ffmpeg: &std::path::Path, args: &[&str]) -> Result<(), String> {
@@ -1398,7 +1587,10 @@ async fn run_gif_ffmpeg(ffmpeg: &std::path::Path, args: &[&str]) -> Result<(), S
         .stderr(std::process::Stdio::null());
     #[cfg(windows)]
     cmd.creation_flags(0x0800_0000);
-    let status = cmd.status().await.map_err(|e| format!("spawn ffmpeg: {}", e))?;
+    let status = cmd
+        .status()
+        .await
+        .map_err(|e| format!("spawn ffmpeg: {}", e))?;
     if !status.success() {
         return Err(format!("ffmpeg exit {:?}", status.code()));
     }
@@ -1420,7 +1612,9 @@ pub async fn mpv_clip_save(
 ) -> Result<ClipResult, String> {
     let mpv = {
         let g = state.inner.lock().await;
-        g.as_ref().map(|s| s.mpv.clone()).ok_or_else(|| "mpv not started".to_string())?
+        g.as_ref()
+            .map(|s| s.mpv.clone())
+            .ok_or_else(|| "mpv not started".to_string())?
     };
     let src = mpv
         .get_property::<String>("path")
@@ -1499,19 +1693,22 @@ pub async fn mpv_clip_save(
         return Err(format!("clip encode failed (mpv exit {:?})", status.code()));
     }
     match std::fs::metadata(&out_path) {
-        Ok(m) if m.len() > 0 => Ok(ClipResult { path: out_path, duration: dur }),
+        Ok(m) if m.len() > 0 => Ok(ClipResult {
+            path: out_path,
+            duration: dur,
+        }),
         _ => Err("clip output missing".into()),
     }
 }
 
 #[tauri::command]
-pub async fn mpv_screenshot_data_url(
-    state: State<'_, MpvState>,
-) -> Result<String, String> {
+pub async fn mpv_screenshot_data_url(state: State<'_, MpvState>) -> Result<String, String> {
     use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
     let mpv = {
         let g = state.inner.lock().await;
-        g.as_ref().map(|s| s.mpv.clone()).ok_or_else(|| "mpv not started".to_string())?
+        g.as_ref()
+            .map(|s| s.mpv.clone())
+            .ok_or_else(|| "mpv not started".to_string())?
     };
     let temp = std::env::temp_dir().join(format!("harbor-cw-{}.jpg", Uuid::new_v4()));
     let path_str = temp.to_string_lossy().to_string();
@@ -1570,9 +1767,15 @@ pub async fn mpv_sub_add(
 ) -> Result<(), String> {
     let mpv = {
         let g = state.inner.lock().await;
-        g.as_ref().map(|s| s.mpv.clone()).ok_or_else(|| "mpv not started".to_string())?
+        g.as_ref()
+            .map(|s| s.mpv.clone())
+            .ok_or_else(|| "mpv not started".to_string())?
     };
-    let flag = if select.unwrap_or(true) { "select" } else { "auto" };
+    let flag = if select.unwrap_or(true) {
+        "select"
+    } else {
+        "auto"
+    };
     let title_input = title.filter(|s| !s.is_empty()).unwrap_or_default();
     let lang_owned = lang.filter(|s| !s.is_empty()).unwrap_or_default();
     let title_for_mpv = if !title_input.is_empty() {
@@ -1585,11 +1788,15 @@ pub async fn mpv_sub_add(
     let cmd_name = std::ffi::CString::new("sub-add").map_err(|e| format!("cstring: {}", e))?;
     let url_c = std::ffi::CString::new(url.as_str()).map_err(|e| format!("cstring url: {}", e))?;
     let flag_c = std::ffi::CString::new(flag).map_err(|e| format!("cstring flag: {}", e))?;
-    let title_c = std::ffi::CString::new(title_for_mpv.as_str()).map_err(|e| format!("cstring title: {}", e))?;
+    let title_c = std::ffi::CString::new(title_for_mpv.as_str())
+        .map_err(|e| format!("cstring title: {}", e))?;
     let lang_c = if lang_owned.is_empty() {
         None
     } else {
-        Some(std::ffi::CString::new(lang_owned.as_str()).map_err(|e| format!("cstring lang: {}", e))?)
+        Some(
+            std::ffi::CString::new(lang_owned.as_str())
+                .map_err(|e| format!("cstring lang: {}", e))?,
+        )
     };
     let mut ptrs: Vec<*const std::os::raw::c_char> = vec![
         cmd_name.as_ptr(),
@@ -1620,7 +1827,12 @@ fn subtitle_extension(
     format_hint: Option<&str>,
     bytes: &[u8],
 ) -> &'static str {
-    match format_hint.unwrap_or_default().trim().to_ascii_lowercase().as_str() {
+    match format_hint
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
         "ass" | "ssa" => return "ass",
         "vtt" | "webvtt" => return "vtt",
         "srt" | "subrip" => return "srt",
@@ -1628,7 +1840,10 @@ fn subtitle_extension(
     }
     let head_len = bytes.len().min(1024);
     let head = String::from_utf8_lossy(&bytes[..head_len]).to_ascii_lowercase();
-    if head.contains("[script info]") || head.contains("[v4+ styles]") || head.contains("[v4 styles]") {
+    if head.contains("[script info]")
+        || head.contains("[v4+ styles]")
+        || head.contains("[v4 styles]")
+    {
         return "ass";
     }
     if head.trim_start_matches('\u{feff}').starts_with("webvtt") {
@@ -1644,13 +1859,17 @@ fn subtitle_extension(
     "srt"
 }
 
-fn normalize_subtitle_bytes(bytes: &[u8], encoding_hint: Option<&str>, lang: Option<&str>) -> Vec<u8> {
+fn normalize_subtitle_bytes(
+    bytes: &[u8],
+    encoding_hint: Option<&str>,
+    lang: Option<&str>,
+) -> Vec<u8> {
     if let Ok(text) = std::str::from_utf8(bytes) {
         return text.trim_start_matches('\u{feff}').as_bytes().to_vec();
     }
 
-    let hinted = encoding_hint
-        .and_then(|label| encoding_rs::Encoding::for_label(label.trim().as_bytes()));
+    let hinted =
+        encoding_hint.and_then(|label| encoding_rs::Encoding::for_label(label.trim().as_bytes()));
     let language = lang.unwrap_or_default().trim().to_ascii_lowercase();
     let encoding = hinted.or_else(|| {
         if matches!(language.as_str(), "ar" | "ara" | "arabic") {
@@ -1714,8 +1933,7 @@ mod subtitle_download_tests {
     #[test]
     fn converts_windows_1256_arabic_to_utf8() {
         let windows_1256 = [
-            0xe3, 0xd1, 0xcd, 0xc8, 0xc7, 0x20, 0xc8, 0xc7, 0xe1, 0xda, 0xc7, 0xe1,
-            0xe3,
+            0xe3, 0xd1, 0xcd, 0xc8, 0xc7, 0x20, 0xc8, 0xc7, 0xe1, 0xda, 0xc7, 0xe1, 0xe3,
         ];
         let utf8 = normalize_subtitle_bytes(&windows_1256, Some("windows-1256"), Some("ar"));
         assert_eq!(String::from_utf8(utf8).unwrap(), "مرحبا بالعالم");
@@ -1724,8 +1942,7 @@ mod subtitle_download_tests {
     #[test]
     fn uses_arabic_language_as_legacy_encoding_fallback() {
         let windows_1256 = [
-            0xe3, 0xd1, 0xcd, 0xc8, 0xc7, 0x20, 0xc8, 0xc7, 0xe1, 0xda, 0xc7, 0xe1,
-            0xe3,
+            0xe3, 0xd1, 0xcd, 0xc8, 0xc7, 0x20, 0xc8, 0xc7, 0xe1, 0xda, 0xc7, 0xe1, 0xe3,
         ];
         let utf8 = normalize_subtitle_bytes(&windows_1256, None, Some("ara"));
         assert_eq!(String::from_utf8(utf8).unwrap(), "مرحبا بالعالم");
@@ -1866,9 +2083,87 @@ pub async fn mpv_stop(app: AppHandle, state: State<'_, MpvState>) -> Result<(), 
             *guard = None;
         }
         MPV_POS_LAST_COUNT.store(usize::MAX, std::sync::atomic::Ordering::Relaxed);
+        // Orphan mpv child HWNDs can paint solid black under a transparent WebView.
+        hide_embedded_mpv_children(&app);
+        // Restore opaque WebView background when leaving embedded playback.
+        crate::webview_helpers::apply_opaque(&app, "main");
     }
-    let _ = app;
+    #[cfg(not(windows))]
+    {
+        let _ = app;
+    }
     Ok(())
+}
+
+/// Hide/destroy leftover mpv child windows under the main HWND so they cannot
+/// cover the WebView after stop (stuck black surface).
+#[cfg(windows)]
+fn hide_embedded_mpv_children(app: &AppHandle) {
+    use windows::core::BOOL;
+    use windows::Win32::Foundation::{HWND, LPARAM};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        DestroyWindow, EnumChildWindows, GetClassNameW, GetWindowTextW, SetWindowPos, HWND_BOTTOM,
+        SWP_HIDEWINDOW, SWP_NOACTIVATE,
+    };
+    let Some(window) = app.get_webview_window("main") else {
+        return;
+    };
+    let Ok(parent_hwnd) = window.hwnd() else {
+        return;
+    };
+
+    struct EnumState {
+        mpv_hwnds: Vec<isize>,
+    }
+    let mut state = EnumState {
+        mpv_hwnds: Vec::new(),
+    };
+    let state_ptr = &mut state as *mut EnumState;
+
+    unsafe extern "system" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        let mut class_buf = [0u16; 256];
+        let class_len = GetClassNameW(hwnd, &mut class_buf);
+        let class_name = String::from_utf16_lossy(&class_buf[..class_len as usize]);
+        let mut title_buf = [0u16; 256];
+        let title_len = GetWindowTextW(hwnd, &mut title_buf);
+        let title = String::from_utf16_lossy(&title_buf[..title_len as usize]);
+        let is_mpv = class_name == "mpv"
+            || class_name.starts_with("mpv ")
+            || (class_name.is_empty() && title.starts_with("Harbor"));
+        if is_mpv {
+            let s = lparam.0 as *mut EnumState;
+            (*s).mpv_hwnds.push(hwnd.0 as isize);
+        }
+        BOOL(1)
+    }
+
+    unsafe {
+        let _ = EnumChildWindows(
+            Some(parent_hwnd),
+            Some(enum_proc),
+            LPARAM(state_ptr as isize),
+        );
+        for h in &state.mpv_hwnds {
+            let target = HWND(*h as *mut _);
+            let _ = SetWindowPos(
+                target,
+                Some(HWND_BOTTOM),
+                -32000,
+                -32000,
+                1,
+                1,
+                SWP_NOACTIVATE | SWP_HIDEWINDOW,
+            );
+            // Best-effort destroy; ignore failures (mpv may already be tearing down).
+            let _ = DestroyWindow(target);
+        }
+    }
+    if !state.mpv_hwnds.is_empty() {
+        eprintln!(
+            "[harbor::mpv] cleaned {} embedded mpv child hwnd(s) after stop",
+            state.mpv_hwnds.len()
+        );
+    }
 }
 
 #[cfg(windows)]
@@ -1938,7 +2233,8 @@ unsafe extern "system" fn mpv_subclass_proc(
 }
 
 #[cfg(windows)]
-static MPV_POS_LAST_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(usize::MAX);
+static MPV_POS_LAST_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(usize::MAX);
 
 #[cfg(windows)]
 static MPV_POS_LAST_RECT: std::sync::Mutex<Option<(isize, i32, i32, u32, u32)>> =
@@ -1948,18 +2244,17 @@ static MPV_POS_LAST_RECT: std::sync::Mutex<Option<(isize, i32, i32, u32, u32)>> 
 static MPV_HDR_STAGE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 #[cfg(windows)]
-fn position_embedded_mpv_child(
-    app: &AppHandle,
-    css: MpvGeometry,
-) -> Result<(), String> {
+fn position_embedded_mpv_child(app: &AppHandle, css: MpvGeometry) -> Result<(), String> {
     use windows::core::BOOL;
     use windows::Win32::Foundation::{HWND, LPARAM};
+    use windows::Win32::Graphics::Gdi::{
+        RedrawWindow, RDW_ALLCHILDREN, RDW_INVALIDATE, RDW_UPDATENOW,
+    };
     use windows::Win32::UI::Shell::{RemoveWindowSubclass, SetWindowSubclass};
-    use windows::Win32::Graphics::Gdi::{RedrawWindow, RDW_ALLCHILDREN, RDW_INVALIDATE, RDW_UPDATENOW};
     use windows::Win32::UI::WindowsAndMessaging::{
         EnumChildWindows, GetClassNameW, GetWindowLongW, GetWindowTextW, SetWindowLongW,
-        SetWindowPos, GWL_EXSTYLE, HWND_BOTTOM, HWND_TOP, SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOMOVE,
-        SWP_NOSIZE, SWP_SHOWWINDOW, WS_EX_TRANSPARENT,
+        SetWindowPos, GWL_EXSTYLE, HWND_BOTTOM, HWND_TOP, SWP_HIDEWINDOW, SWP_NOACTIVATE,
+        SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, WS_EX_TRANSPARENT,
     };
     let hdr_stage = MPV_HDR_STAGE.load(std::sync::atomic::Ordering::Relaxed)
         && app
@@ -1993,7 +2288,10 @@ fn position_embedded_mpv_child(
         mpv_hwnds: Vec<isize>,
         all_classes: Vec<(isize, String, String)>,
     }
-    let mut state = EnumState { mpv_hwnds: Vec::new(), all_classes: Vec::new() };
+    let mut state = EnumState {
+        mpv_hwnds: Vec::new(),
+        all_classes: Vec::new(),
+    };
     let state_ptr = &mut state as *mut EnumState;
 
     unsafe extern "system" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
@@ -2004,8 +2302,11 @@ fn position_embedded_mpv_child(
         let title_len = GetWindowTextW(hwnd, &mut title_buf);
         let title = String::from_utf16_lossy(&title_buf[..title_len as usize]);
         let s = lparam.0 as *mut EnumState;
-        (*s).all_classes.push((hwnd.0 as isize, class_name.clone(), title.clone()));
-        let is_mpv = class_name == "mpv" || class_name.starts_with("mpv ") || (class_name.is_empty() && title.starts_with("Harbor"));
+        (*s).all_classes
+            .push((hwnd.0 as isize, class_name.clone(), title.clone()));
+        let is_mpv = class_name == "mpv"
+            || class_name.starts_with("mpv ")
+            || (class_name.is_empty() && title.starts_with("Harbor"));
         if is_mpv {
             (*s).mpv_hwnds.push(hwnd.0 as isize);
         }
@@ -2020,14 +2321,25 @@ fn position_embedded_mpv_child(
         );
     }
 
-    let prev_count = MPV_POS_LAST_COUNT.swap(state.mpv_hwnds.len(), std::sync::atomic::Ordering::Relaxed);
+    let prev_count =
+        MPV_POS_LAST_COUNT.swap(state.mpv_hwnds.len(), std::sync::atomic::Ordering::Relaxed);
     if prev_count != state.mpv_hwnds.len() {
-        eprintln!("[harbor::mpv] enumerated {} children of main hwnd:", state.all_classes.len());
+        eprintln!(
+            "[harbor::mpv] enumerated {} children of main hwnd:",
+            state.all_classes.len()
+        );
         for (h, cls, title) in &state.all_classes {
             eprintln!("  hwnd={:#x} class={:?} title={:?}", h, cls, title);
         }
-        eprintln!("[harbor::mpv] mpv child matches found: {} (was {})", state.mpv_hwnds.len(), prev_count);
-        eprintln!("[harbor::mpv] requested rect x={} y={} w={} h={}", x, y, w, h);
+        eprintln!(
+            "[harbor::mpv] mpv child matches found: {} (was {})",
+            state.mpv_hwnds.len(),
+            prev_count
+        );
+        eprintln!(
+            "[harbor::mpv] requested rect x={} y={} w={} h={}",
+            x, y, w, h
+        );
     }
 
     let found = state.mpv_hwnds;
@@ -2069,10 +2381,18 @@ fn position_embedded_mpv_child(
                     SetWindowLongW(target, GWL_EXSTYLE, want_ex);
                 }
                 if hdr_stage {
-                    let _ = RemoveWindowSubclass(target, Some(mpv_subclass_proc), HARBOR_MPV_SUBCLASS_ID);
+                    let _ = RemoveWindowSubclass(
+                        target,
+                        Some(mpv_subclass_proc),
+                        HARBOR_MPV_SUBCLASS_ID,
+                    );
                 } else {
-                    let _ =
-                        SetWindowSubclass(target, Some(mpv_subclass_proc), HARBOR_MPV_SUBCLASS_ID, 0);
+                    let _ = SetWindowSubclass(
+                        target,
+                        Some(mpv_subclass_proc),
+                        HARBOR_MPV_SUBCLASS_ID,
+                        0,
+                    );
                 }
                 let _ = SetWindowPos(
                     target,
@@ -2132,7 +2452,12 @@ mod geometry_tests {
 
         assert_eq!(
             map_css_geometry(&css, 1710.0, 1040.0),
-            NativeMpvRect { x: 0.0, y: 0.0, width: 1710.0, height: 1040.0 }
+            NativeMpvRect {
+                x: 0.0,
+                y: 0.0,
+                width: 1710.0,
+                height: 1040.0
+            }
         );
     }
 
@@ -2149,7 +2474,12 @@ mod geometry_tests {
 
         assert_eq!(
             map_css_geometry(&css, 2000.0, 1200.0),
-            NativeMpvRect { x: 20.0, y: 30.0, width: 1000.0, height: 450.0 }
+            NativeMpvRect {
+                x: 20.0,
+                y: 30.0,
+                width: 1000.0,
+                height: 450.0
+            }
         );
     }
 
@@ -2166,7 +2496,42 @@ mod geometry_tests {
 
         assert_eq!(
             map_css_geometry(&css, 1920.0, 1080.0),
-            NativeMpvRect { x: 0.0, y: 0.0, width: 1920.0, height: 1080.0 }
+            NativeMpvRect {
+                x: 0.0,
+                y: 0.0,
+                width: 1920.0,
+                height: 1080.0
+            }
         );
+    }
+}
+
+#[cfg(test)]
+mod event_backoff_tests {
+    use super::{record_event_poll_success, EventErrorBackoff, MPV_EVENT_MAX_CONSECUTIVE_ERRORS};
+    use std::time::Duration;
+
+    #[test]
+    fn event_error_backoff_grows_caps_and_resets() {
+        let mut backoff = EventErrorBackoff::default();
+        assert_eq!(backoff.next_delay(), Some(Duration::from_millis(40)));
+        assert_eq!(backoff.next_delay(), Some(Duration::from_millis(80)));
+        assert_eq!(backoff.next_delay(), Some(Duration::from_millis(160)));
+        backoff.reset();
+        assert_eq!(backoff.next_delay(), Some(Duration::from_millis(40)));
+        for _ in 1..MPV_EVENT_MAX_CONSECUTIVE_ERRORS {
+            let _ = backoff.next_delay();
+        }
+        assert_eq!(backoff.next_delay(), None);
+    }
+
+    #[test]
+    fn successful_empty_poll_resets_consecutive_errors() {
+        let mut backoff = EventErrorBackoff::default();
+        assert_eq!(backoff.next_delay(), Some(Duration::from_millis(40)));
+
+        record_event_poll_success(&mut backoff);
+
+        assert_eq!(backoff.next_delay(), Some(Duration::from_millis(40)));
     }
 }

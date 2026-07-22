@@ -6,6 +6,7 @@ import {
   useContext,
   useEffect,
   useLayoutEffect,
+  useMemo,
   useRef,
   useState,
   type ReactNode,
@@ -13,12 +14,25 @@ import {
 import { ChevronLeft, ChevronRight } from "lucide-react";
 import { useT } from "@/lib/i18n";
 import { useSettings } from "@/lib/settings";
+import { resetPosterDock as resetPosterDockItems, updatePosterDock } from "@/lib/poster-dock";
 import { useView } from "@/lib/view";
 import { ThreeLiquidGlassSurface } from "@/components/ThreeLiquidGlassSurface";
 
 const GAP = 20;
 const EAGER_COUNT = 6;
 const NEAR_MARGIN = "300px";
+
+function isRtlTrack(el: HTMLDivElement): boolean {
+  return getComputedStyle(el).direction === "rtl";
+}
+
+function readPos(el: HTMLDivElement): number {
+  return isRtlTrack(el) ? -el.scrollLeft : el.scrollLeft;
+}
+
+function writePos(el: HTMLDivElement, pos: number): void {
+  el.scrollLeft = isRtlTrack(el) ? -pos : pos;
+}
 
 export type RowShape = "portrait" | "landscape" | "service" | "rank" | "tile";
 
@@ -144,6 +158,7 @@ export function Row({
   const { settings } = useSettings();
   const t = useT();
   const effMin = Math.max(72, Math.round(min * settings.posterScale));
+  const dockEnabled = shape === "portrait" && settings.posterDockMagnification;
   const containerRef = useRef<HTMLDivElement>(null);
   const trackRef = useRef<HTMLDivElement>(null);
   const [trackEl, setTrackEl] = useState<HTMLDivElement | null>(null);
@@ -168,12 +183,6 @@ export function Row({
     setCellWidth((available - (fits - 1) * GAP) / fits);
   };
 
-  const isRtlTrack = (el: HTMLDivElement) => getComputedStyle(el).direction === "rtl";
-  const readPos = (el: HTMLDivElement) => (isRtlTrack(el) ? -el.scrollLeft : el.scrollLeft);
-  const writePos = (el: HTMLDivElement, pos: number) => {
-    el.scrollLeft = isRtlTrack(el) ? -pos : pos;
-  };
-
   const measureScroll = () => {
     const el = trackRef.current;
     if (!el) return;
@@ -184,26 +193,22 @@ export function Row({
     if (el.clientWidth > 0 && remaining < 800) onEndRef.current?.();
   };
 
-  const childCount = Children.count(children);
-  const restoredRef = useRef(false);
+  // Keep native CSS grid rails — horizontal virtualization made posters look
+  // mid-scrolled / misaligned. LazyChild + IO is enough for row-sized lists.
+  const items = useMemo(() => Children.toArray(children), [children]);
+  const childCount = items.length;
+
   const userInteractedRef = useRef(false);
-  const { rememberRowScroll, recallRowScroll } = useView();
+  const { rememberRowScroll } = useView();
   useLayoutEffect(() => {
     measure();
+    // Always pin rails to the first poster unless the user scrolled this session.
+    // Restoring saved scrollLeft made every page open mid-row ("posters scrolled").
+    if (trackEl && cellWidth != null && childCount > 0 && !userInteractedRef.current) {
+      if (readPos(trackEl) !== 0) writePos(trackEl, 0);
+    }
     measureScroll();
-    if (!trackEl || cellWidth == null) return;
-    if (scrollKey && !restoredRef.current && childCount > 0) {
-      const n = recallRowScroll(scrollKey);
-      const max = trackEl.scrollWidth - trackEl.clientWidth;
-      const target = n != null && n > 0 && max > 0 ? Math.min(n, max) : 0;
-      if (readPos(trackEl) !== target) writePos(trackEl, target);
-      restoredRef.current = true;
-      return;
-    }
-    if (!userInteractedRef.current && readPos(trackEl) !== 0) {
-      writePos(trackEl, 0);
-    }
-  }, [children, childCount, cellWidth, trackEl, scrollKey, recallRowScroll, effMin]);
+  }, [children, childCount, cellWidth, trackEl, effMin]);
 
   useEffect(() => {
     const container = containerRef.current;
@@ -270,13 +275,13 @@ export function Row({
     const onReset = (e: Event) => {
       const detail = (e as CustomEvent<{ prefix?: string }>).detail;
       if (!scrollKey) return;
-      if (!detail?.prefix || !scrollKey.startsWith(detail.prefix)) return;
+      // Empty/missing prefix = reset every rail (nav change). Otherwise match prefix.
+      if (detail?.prefix && !scrollKey.startsWith(detail.prefix)) return;
       if (saveTimer != null) {
         window.clearTimeout(saveTimer);
         saveTimer = null;
       }
       writePos(track, 0);
-      rememberRowScroll(scrollKey, 0);
       userInteractedRef.current = false;
       measureScroll();
     };
@@ -320,6 +325,55 @@ export function Row({
   const rafId = useRef<number | null>(null);
   const strideRef = useRef(effMin + GAP);
   strideRef.current = (cellWidth ?? effMin) + GAP;
+  const dockFrameRef = useRef<number | null>(null);
+  const dockPointerXRef = useRef<number | null>(null);
+
+  const resetPosterDock = useCallback(() => {
+    const track = trackRef.current;
+    if (track) resetPosterDockItems(track);
+  }, []);
+
+  const applyPosterDock = useCallback(() => {
+    dockFrameRef.current = null;
+    const track = trackRef.current;
+    const pointerX = dockPointerXRef.current;
+    if (!dockEnabled || !track || pointerX === null) {
+      resetPosterDock();
+      return;
+    }
+
+    updatePosterDock({
+      track,
+      pointerX,
+      cellWidth: cellWidth ?? effMin,
+      gap: GAP,
+      scrollPosition: readPos(track),
+      rtl: isRtlTrack(track),
+      transitionMs: settings.posterDockTransitionMs,
+    });
+  }, [cellWidth, dockEnabled, effMin, resetPosterDock, settings.posterDockTransitionMs]);
+
+  const schedulePosterDock = useCallback(
+    (clientX: number) => {
+      dockPointerXRef.current = clientX;
+      if (dockFrameRef.current === null) {
+        dockFrameRef.current = requestAnimationFrame(applyPosterDock);
+      }
+    },
+    [applyPosterDock],
+  );
+
+  useEffect(
+    () => () => {
+      if (dockFrameRef.current !== null) cancelAnimationFrame(dockFrameRef.current);
+      resetPosterDock();
+    },
+    [resetPosterDock],
+  );
+
+  useEffect(() => {
+    if (!dockEnabled) resetPosterDock();
+  }, [dockEnabled, resetPosterDock]);
 
   const cancelGlide = () => {
     if (rafId.current != null) {
@@ -358,6 +412,8 @@ export function Row({
   };
 
   const onPointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
+    dockPointerXRef.current = null;
+    resetPosterDock();
     if (e.button !== 0 || e.pointerType === "touch") return;
     if (!(e.target as Element).closest("button")) return;
     const el = trackRef.current;
@@ -378,6 +434,9 @@ export function Row({
   const onPointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
     const d = drag.current;
     const el = trackRef.current;
+    if (dockEnabled && e.pointerType !== "touch" && e.buttons === 0 && !d.active) {
+      schedulePosterDock(e.clientX);
+    }
     if (!d.active || !el) return;
     const dx = e.clientX - d.startX;
     if (!d.moved && Math.abs(dx) < 6) return;
@@ -483,11 +542,22 @@ export function Row({
             ref={trackCb}
             onPointerDown={onPointerDown}
             onPointerMove={onPointerMove}
-            onPointerUp={endDrag}
-            onPointerCancel={endDrag}
+            onPointerUp={(event) => {
+              endDrag(event);
+              if (dockEnabled && event.pointerType !== "touch") schedulePosterDock(event.clientX);
+            }}
+            onPointerCancel={(event) => {
+              endDrag(event);
+              dockPointerXRef.current = null;
+              resetPosterDock();
+            }}
+            onPointerLeave={() => {
+              dockPointerXRef.current = null;
+              resetPosterDock();
+            }}
             onClickCapture={onClickCapture}
             onDragStart={(e) => e.preventDefault()}
-            className="harbor-row-track grid grid-flow-col items-start gap-5 overflow-x-auto p-5 -m-5 scroll-ps-5 scroll-pe-5 [scroll-snap-type:x_mandatory] *:snap-start [&::-webkit-scrollbar]:hidden [-ms-overflow-style:none] [scrollbar-width:none] [overflow-anchor:none] overscroll-x-contain [&_img]:select-none [&_img]:[-webkit-user-drag:none]"
+            className="harbor-row-track grid grid-flow-col items-start gap-5 overflow-x-auto px-5 pb-8 pt-14 -mx-5 -mb-8 -mt-14 scroll-ps-5 scroll-pe-5 [scroll-snap-type:x_mandatory] *:snap-start [&::-webkit-scrollbar]:hidden [-ms-overflow-style:none] [scrollbar-width:none] [overflow-anchor:none] overscroll-x-contain [&_img]:select-none [&_img]:[-webkit-user-drag:none]"
             style={{
               gridAutoColumns: cellWidth != null ? `${cellWidth}px` : `${effMin}px`,
               willChange: "transform",
@@ -495,12 +565,12 @@ export function Row({
               contain: "layout style",
             }}
           >
-            {Children.map(children, (child, i) => {
+            {items.map((child, i) => {
               const span = isValidElement(child)
                 ? (child.props as { style?: { gridColumn?: string } }).style?.gridColumn
                 : undefined;
               return (
-                <LazyChild eager={i < EAGER_COUNT} shape={shape} span={span}>
+                <LazyChild key={i} eager={i < EAGER_COUNT} shape={shape} span={span}>
                   {child}
                 </LazyChild>
               );
@@ -537,13 +607,17 @@ function EdgeArrow({
       >
         <ThreeLiquidGlassSurface
           radius="9999px"
-          shaderRadius={1}
-          intensity={1}
-          className={`h-11 w-11 pointer-events-auto ${
-            visible
-              ? "opacity-0 group-hover/row:opacity-100 focus-within:opacity-100"
-              : "pointer-events-none opacity-0"
-          }`}
+          shaderRadius={0.58}
+          intensity={0.9}
+          style={{
+            boxShadow: "inset 0 1px 0 rgba(255,255,255,0.10), inset 0 -1px 0 rgba(0,0,0,0.05)",
+          }}
+          className={`h-11 w-11 pointer-events-auto border border-white/[0.08]
+            transition-opacity duration-200 ${
+              visible
+                ? "opacity-85 group-hover/row:opacity-100 focus-within:opacity-100"
+                : "pointer-events-none opacity-0"
+            }`}
           contentClassName="flex h-full w-full items-center justify-center"
         >
           <button
@@ -552,11 +626,11 @@ function EdgeArrow({
             aria-label={label}
             tabIndex={visible ? 0 : -1}
             className="
-      flex h-full w-full
-      items-center justify-center
-      rounded-full bg-transparent
-      text-ink outline-none
-    "
+            flex h-full w-full
+            items-center justify-center
+            rounded-full bg-transparent
+            text-ink outline-none
+          "
           >
             {side === "left" ? (
               <ChevronLeft size={22} strokeWidth={2.2} className="dir-icon" />
@@ -577,13 +651,17 @@ function EdgeArrow({
     >
       <ThreeLiquidGlassSurface
         radius="9999px"
-        shaderRadius={1}
-        intensity={1}
-        className={`h-11 w-11 pointer-events-auto ${
-          visible
-            ? "opacity-0 group-hover/row:opacity-100 focus-within:opacity-100"
-            : "pointer-events-none opacity-0"
-        }`}
+        shaderRadius={0.58}
+        intensity={0.9}
+        style={{
+          boxShadow: "inset 0 1px 0 rgba(255,255,255,0.10), inset 0 -1px 0 rgba(0,0,0,0.05)",
+        }}
+        className={`h-11 w-11 pointer-events-auto border border-white/[0.08]
+            transition-opacity duration-200 ${
+              visible
+                ? "opacity-85 group-hover/row:opacity-100 focus-within:opacity-100"
+                : "pointer-events-none opacity-0"
+            }`}
         contentClassName="flex h-full w-full items-center justify-center"
       >
         <button

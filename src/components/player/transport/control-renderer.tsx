@@ -60,6 +60,7 @@ import { SpeedMenu } from "./speed-menu";
 import { AspectMenu } from "./aspect-menu";
 import { Anime4kMenu } from "./anime4k-menu";
 import { HdrToggleBigBtn } from "./hdr-toggle-btn";
+import { RtxHdrToggleBigBtn } from "./rtx-hdr-toggle-btn";
 import type { Anime4kChoice } from "@/views/player/hooks/use-anime4k";
 import { DrawToggle } from "./draw-toggle";
 import { CastButton } from "./cast-button";
@@ -316,10 +317,9 @@ export function renderControl(id: PlayerControlId, ctx: ControlContext): ReactNo
         <Tooltip label={ctx.playing ? t("Pause") : t("Play")}>
           <ThreeLiquidGlassSurface
             radius="9999px"
-            shaderRadius={1}
-            intensity={1.05}
-            refractionStrength={1.18}
-            spectralStrength={1.08}
+            shaderRadius={0.28}
+            intensity={0.9}
+            refractionStrength={0.08}
             className={`
               shrink-0 rounded-full
               border border-white/[0.10]
@@ -327,17 +327,17 @@ export function renderControl(id: PlayerControlId, ctx: ControlContext): ReactNo
             `}
             contentClassName="h-full w-full"
             style={{
-              background: "transparent",
-              boxShadow: "none",
+              boxShadow: "inset 0 1px 0 rgba(255,255,255,0.10), inset 0 -1px 0 rgba(0,0,0,0.05)",
             }}
           >
             <button
               type="button"
               onClick={ctx.onPlayPause}
+              data-player-play-pause
               data-tv-initial-focus
               aria-label={ctx.playing ? t("Pause") : t("Play")}
               className="
-                flex h-full w-full
+                relative flex h-full w-full
                 items-center justify-center
                 rounded-full
                 bg-transparent
@@ -461,6 +461,10 @@ export function renderControl(id: PlayerControlId, ctx: ControlContext): ReactNo
     case "hdr-toggle": {
       if (ctx.tight || ctx.engine === "html5") return null;
       return <HdrToggleBigBtn />;
+    }
+    case "rtx-hdr-toggle": {
+      if (ctx.tight || ctx.engine === "html5") return null;
+      return <RtxHdrToggleBigBtn meta={ctx.meta} />;
     }
     case "draw-toggle": {
       if (ctx.compact || !ctx.showDraw) return null;
